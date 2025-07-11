@@ -74,7 +74,7 @@ transformer = Transformer.from_crs("epsg:4978", "epsg:4326", always_xy=True)
 
 
 #cx,cy,cz = -2789740.704430894, 4760053.504586963, 3189296.4507276197
-cx,cy,cz = -2789664.368623, 4760394.846998 ,3188839.182357
+cx,cy,cz = -2793868.430852 ,4759703.469316 ,3186210.37923
 
 lon, lat, alt = transformer.transform(cx, cy, cz)
 

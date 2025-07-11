@@ -1,4 +1,4 @@
-# api/main.py
+# api/web.py
 import os
 import sys
 import uvicorn
@@ -15,17 +15,26 @@ from src.utils.coordinate import wgs84_to_ecef
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
 
-app = FastAPI(title="3D Building Collision Detector")
+app = FastAPI(title="3D Building Collision Detector", openapi_prefix="/api/v1")
 
 
 @app.post("/init-data")
-async def initialize_data():
+async def initialize_data(tileset_path: str):
+    """
+        触发瓦片集解析并插入数据库的操作。
+
+        参数:
+            tileset_path (str): 瓦片集文件的路径（例如："/data/tileset.json"）
+        """
+    if not os.path.exists(tileset_path):
+            raise HTTPException(status_code=400, detail=f"Tileset path does not exist: {tileset_path}")
+
     """
     触发瓦片集解析并插入数据库的操作。
     """
     try:
         with get_db_connection() as conn:
-            init_tileset(conn)
+            init_tileset(conn, tileset_path)
 
         return {"status": "success", "result": "Data initialized successfully."}
 
@@ -62,15 +71,3 @@ async def detect_collision(
         return {"status": "error", "message": str(e)}
 
 
-def main():
-    uvicorn.run(
-        "api.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
-    )
-
-
-if __name__ == "__main__":
-    main()

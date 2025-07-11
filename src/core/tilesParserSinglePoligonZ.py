@@ -172,62 +172,67 @@ def collect_tileset_bounds(tileset: TileSet, tileset_dir: str) -> List[Dict]:
 # 5️⃣ 插入数据库和碰撞检测（基于BOX3D）
 # =============================================
 def insert_buildings_to_postgis(conn, building_data: List[Dict]):
-    # 建表语句：使用BOX3D类型
+    # 建表语句：
     init_table_query = """
-        CREATE TABLE IF NOT EXISTS dk_buildings (
-        id UUID PRIMARY KEY,
-        name TEXT,
-        tile_url TEXT,
-        bounding_volume GEOMETRY(POLYGONZ, 4978),  -- 改为 POLYGONZ 类型
-        refine TEXT,
-        properties JSONB,
-        height NUMERIC  -- 👈 新增 height 字段
-    );
+            CREATE TABLE IF NOT EXISTS dk_buildings (
+                id UUID PRIMARY KEY,
+                build_id BIGINT NOT NULL,  -- 新增字段，存储 tile_url_md5 的整形值
+                name TEXT,
+                tile_url TEXT,
+                bounding_volume GEOMETRY(POLYGONZ, 4978),
+                refine TEXT,
+                properties JSONB,
+                height NUMERIC,
+                create_time TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                update_time TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                is_delete BOOLEAN NOT NULL DEFAULT FALSE
+            );
 
-    -- 创建空间索引
-    CREATE INDEX IF NOT EXISTS idx_buildings_geom_3d 
-    ON dk_buildings USING GIST (bounding_volume);
+            -- 创建空间索引
+            CREATE INDEX IF NOT EXISTS idx_buildings_geom_3d 
+            ON dk_buildings USING GIST (bounding_volume);
+
+            -- 为 build_id 创建索引
+            CREATE INDEX IF NOT EXISTS idx_buildings_build_id 
+            ON dk_buildings (build_id);
         """
     with conn.cursor() as cur:
         cur.execute(init_table_query)
     conn.commit()
 
     query = """
-        INSERT INTO dk_buildings 
-        (id, name, tile_url, bounding_volume, refine, properties, height)
-        VALUES (%s, %s, %s, ST_GeomFromEWKT(%s), %s, %s, %s)
-    """
+            INSERT INTO dk_buildings 
+            (id, build_id, name, tile_url, bounding_volume, refine, properties, height)
+            VALUES (%s, %s, %s, %s, ST_GeomFromEWKT(%s), %s, %s, %s)
+        """
 
     records = []
     for b in building_data:
         bv = b["bounding_volume"]
-        # 生成带SRID的EWKT
         ewkt = f"SRID=4978;{bv['to_ewkt']}"
-        print(f"当前瓦片：{ewkt}")
         tile_url = str(b.get("tile_url")) if b.get("tile_url") else None
+        height = float(b.get("height")) if b.get("height") is not None else None
 
-        height = float(b.get("height")) if b.get("height") is not None else None  # 👈 强制转换为 float
-
-        # 基于 tile_url 生成 MD5 ID
+        # 基于 tile_url 生成 MD5 ID 和整形 build_id
         if tile_url:
-            # 创建 MD5 哈希对象
-            md5_hash = hashlib.md5()
-            # 更新哈希值（需要 encode 成 bytes）
-            md5_hash.update(tile_url.encode('utf-8'))
-            # 获取十六进制表示的哈希值
-            tile_url_md5 = md5_hash.hexdigest()
+            md5_hash = hashlib.md5(tile_url.encode('utf-8')).hexdigest()
+            tile_url_md5 = md5_hash
+            # 取 MD5 的前 12 位转换为 48 位整数（避免过大）
+            build_id = int(md5_hash[:12], 16)
         else:
-            # 如果 tile_url 是 None，则回退到 UUID
             tile_url_md5 = str(uuid.uuid4())
+            # 对于没有 tile_url 的情况，使用 UUID 的整数部分
+            build_id = uuid.uuid4().int & 0xFFFFFFFFFFFF  # 限制为 48 位
 
         records.append((
-            tile_url_md5,
+            tile_url_md5,  # 作为 UUID 使用
+            build_id,  # 新增的整形 ID
             "Building",
             tile_url,
             ewkt,
             b.get("refine"),
             json.dumps(b.get("properties", {})),
-            height,  # 👈 插入高度字段
+            height,
         ))
 
     print(f"records: {records[:5]}...")  # 打印前5条记录以检查
@@ -304,12 +309,13 @@ def main():
             print("✅ 安全：当前路径无碰撞风险。")
 
 
-def init_tileset(conn):
-    """初始化瓦片集，解析所有瓦片并插入数据库"""
-    ROOT_TILESET_DIR = "../../3dtiles"  # 根目录（包含根tileset.json）
+def init_tileset(conn, tileset_path: str = None):
 
-    print(f"🔍 正在查找 {ROOT_TILESET_DIR} 下的所有 tileset.json...")
-    all_tileset_files = find_all_tileset_files(ROOT_TILESET_DIR)
+    if not tileset_path:
+        tileset_path = "../../3dtiles"
+
+    print(f"🔍 正在查找 {tileset_path} 下的所有 tileset.json...")
+    all_tileset_files = find_all_tileset_files(tileset_path)
     print(f"📋 找到 {len(all_tileset_files)} 个 tileset.json 文件")
 
     all_building_bounds = []
