@@ -259,7 +259,7 @@ def main():
 
 def init_tileset(conn):
     """初始化瓦片集，解析所有瓦片并插入数据库"""
-    ROOT_TILESET_DIR = "../3dtiles"  # 根目录（包含根tileset.json）
+    ROOT_TILESET_DIR = "../../3dtiles"  # 根目录（包含根tileset.json）
 
     # 步骤1：查找所有 tileset.json 文件（根目录+子目录）
     print(f"🔍 正在查找 {ROOT_TILESET_DIR} 下的所有 tileset.json...")

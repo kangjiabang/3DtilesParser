@@ -1,41 +1,15 @@
+import hashlib
 import json
 import uuid
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 
-# py3dtiles
-from py3dtiles.tileset import TileSet
-import math
-
+import numpy as np
 # PostGIS
 import psycopg2
 from psycopg2.extras import execute_batch
-
-from shapely import wkt
-from shapely.validation import explain_validity
-
-
-def wgs84_to_ecef(lat_deg, lon_deg, alt_m):
-    """将 WGS84 坐标转换为 ECEF 坐标"""
-    a = 6378137.0          # 长半轴
-    f = 1 / 298.257223563  # 扁率
-    b = a * (1 - f)        # 短半轴
-    e_sq = 2 * f - f ** 2   # 第一偏心率平方
-
-    lat = math.radians(lat_deg)
-    lon = math.radians(lon_deg)
-
-    sin_lat = math.sin(lat)
-    cos_lat = math.cos(lat)
-    sin_lon = math.sin(lon)
-    cos_lon = math.cos(lon)
-
-    N = a / math.sqrt(1 - e_sq * sin_lat ** 2)
-    x = (N + alt_m) * cos_lat * cos_lon
-    y = (N + alt_m) * cos_lat * sin_lon
-    z = ((b ** 2 / a ** 2) * N + alt_m) * sin_lat
-
-    return x, y, z
+# py3dtiles
+from py3dtiles.tileset import TileSet
 
 
 # =============================================
@@ -92,63 +66,106 @@ def box_to_polygonz(box):
 # =============================================
 # 3️⃣ 提取单个瓦片集的所有 tile 包围盒（生成Box类型）
 # =============================================
-def collect_tileset_bounds(tileset: TileSet, tileset_dir: str, base_transform=None) -> List[Dict]:
-    """提取瓦片的包围盒底面为 POLYGON Z，并计算高度"""
+def collect_tileset_bounds(tileset: TileSet, tileset_dir: str) -> List[Dict]:
+    """提取瓦片的包围盒底面为 POLYGON Z，并计算高度，考虑 transform 转换"""
+    def _apply_transform(point, matrix):
+        """将局部坐标点应用变换矩阵"""
+        homogeneous_point = np.append(point, 1.0)
+        transformed = matrix @ homogeneous_point
+        return transformed[:3]  # 返回 xyz 部分
 
-    def _recursive_collect(tile):
+    def _matrix_from_column_major(array):
+        """将列优先数组转为 4x4 矩阵"""
+        return np.array(array, dtype=np.float64).reshape((4, 4), order='F')
+
+    def _recursive_collect(tile, parent_transform=None):
+        if parent_transform is None:
+            parent_transform = np.eye(4)
+
         bounds_list = []
 
-        bv = tile.bounding_volume
-        if bv is not None:
-            box = bv._box  # [cx, cy, cz, hx, hy, hz]
+        # 确保 tile 是有效的 Tile 对象
+        if not hasattr(tile, '__dict__'):
+            return bounds_list
 
-            # 使用改进的方法计算底面多边形
-            points = box_to_polygonz(box)
+        # 更新当前 tile 的变换矩阵
+        current_transform = parent_transform.copy()
+        if hasattr(tile, 'transform') and tile.transform is not None:
+            try:
+                local_matrix = _matrix_from_column_major(tile.transform)
+                current_transform = current_transform @ local_matrix
+            except:
+                pass  # 如果转换失败，继续使用父变换
 
-            # 获取中心点和半长
-            cx, cy, cz = box[0], box[1], box[2]
-            dx, dy, dz = box[3], box[7], box[11]
+        # 检查是否是叶子节点 (没有children或children为空)
+        is_leaf = not hasattr(tile, 'children') or not getattr(tile, 'children', [])
 
-            min_z = cz - dz
-            max_z = cz + dz
-            height = max_z - min_z
+        # 只处理叶子节点
+        if is_leaf:
+            # 检查是否有包围盒
+            if hasattr(tile, 'bounding_volume') and tile.bounding_volume is not None:
+                bv = tile.bounding_volume
+                # 检查是否是box类型
+                if hasattr(bv, '_box') and bv._box is not None:
+                    try:
+                        box = bv._box  # [cx, cy, cz, hx, hy, hz]
 
-            tile_url = tile.content_uri if (hasattr(tile, 'content_uri') and tile.content_uri) else None
-            # 只有当 tileUrl 存在时才进行后缀判断
-            if tile_url is None:
-                return []  # 跳过没有 URL 的瓦片
+                        center_local = np.array(box[:3], dtype=np.float64)
+                        x_axis = np.array(box[3:6], dtype=np.float64)
+                        y_axis = np.array(box[6:9], dtype=np.float64)
+                        z_axis = np.array(box[9:12], dtype=np.float64)
 
-            # 使用 .suffix 属性判断是否为 .b3dm 文件
-            if isinstance(tile_url, Path):
-                if tile_url.suffix.lower() != ".b3dm":
-                    return []
-            else:
-                # 如果是字符串，则统一处理
-                if not str(tile_url).lower().endswith(".b3dm"):
-                    return []
+                        # 局部坐标系下的底面四个角点
+                        corners_local = [
+                            center_local - x_axis - y_axis - z_axis,
+                            center_local + x_axis - y_axis - z_axis,
+                            center_local + x_axis + y_axis - z_axis,
+                            center_local - x_axis + y_axis - z_axis,
+                            center_local - x_axis - y_axis + z_axis,
+                            center_local + x_axis - y_axis + z_axis,
+                            center_local + x_axis + y_axis + z_axis,
+                            center_local - x_axis + y_axis + z_axis,
+                        ]
 
-            # 生成 POLYGON Z 的 WKT 字符串
-            coords_str = ", ".join(f"{x:.6f} {y:.6f} {z:.6f}" for x, y, z in points)
-            polygon_ewkt = f"POLYGON Z (({coords_str}))"
+                        # 应用变换矩阵到所有角点
+                        corners_world = [_apply_transform(corner, current_transform) for corner in corners_local]
 
-            print(f"当前瓦片：{polygon_ewkt}")
-            # 记录瓦片信息
-            bounds_info = {
-                "bounding_volume": {"to_ewkt": polygon_ewkt},
-                "tile_url": tile_url,
-                "refine": tile._refine,
-                "properties": {"tileset_dir": tileset_dir},
-                "parent_dir": str(Path(tileset_dir).parent.name),
-                "height": height,  # 👈 新增高度字段
-            }
-            bounds_list.append(bounds_info)
+                        # 构造底面多边形（用于可视化/数据库）
+                        bottom_corners_world = corners_world[:4]
+                        bottom_corners_world.append(bottom_corners_world[0])  # 闭合环
 
+                        coords_str = ", ".join(f"{x:.6f} {y:.6f} {z:.6f}" for x, y, z in bottom_corners_world)
+                        polygon_ewkt = f"POLYGON Z (({coords_str}))"
+
+                        # 获取高度信息（使用局部坐标包围盒的高度）
+                        z_values = [corner[2] for corner in corners_local]
+                        height = max(z_values) - min(z_values)
+
+                        # 生成瓦片 URL（仅处理 .b3dm 文件）
+                        tile_url = getattr(tile, 'content_uri', None)
+                        if tile_url and str(tile_url).lower().endswith(".b3dm"):
+                            bounds_info = {
+                                "bounding_volume": {"to_ewkt": polygon_ewkt},
+                                "tile_url": tile_url,
+                                "refine": getattr(tile, '_refine', None),
+                                "properties": {"tileset_dir": tileset_dir},
+                                "height": height
+                            }
+                            bounds_list.append(bounds_info)
+                    except Exception as e:
+                        print(f"处理tile包围盒时出错: {e}")
+                        pass  # 如果处理包围盒失败，继续下一个 tile
         # 递归处理子瓦片
-        for child in tile.children:
-            bounds_list.extend(_recursive_collect(child))
+        if hasattr(tile, 'children') and getattr(tile, 'children', None):
+            for child in tile.children:
+                try:
+                    bounds_list.extend(_recursive_collect(child, current_transform))
+                except:
+                    continue
+
         return bounds_list
 
-    return _recursive_collect(tileset.root_tile)
+    return _recursive_collect(tileset.root_tile, np.eye(4))
 
 
 # =============================================
@@ -191,8 +208,20 @@ def insert_buildings_to_postgis(conn, building_data: List[Dict]):
 
         height = float(b.get("height")) if b.get("height") is not None else None  # 👈 强制转换为 float
 
+        # 基于 tile_url 生成 MD5 ID
+        if tile_url:
+            # 创建 MD5 哈希对象
+            md5_hash = hashlib.md5()
+            # 更新哈希值（需要 encode 成 bytes）
+            md5_hash.update(tile_url.encode('utf-8'))
+            # 获取十六进制表示的哈希值
+            tile_url_md5 = md5_hash.hexdigest()
+        else:
+            # 如果 tile_url 是 None，则回退到 UUID
+            tile_url_md5 = str(uuid.uuid4())
+
         records.append((
-            str(uuid.uuid4()),
+            tile_url_md5,
             "Building",
             tile_url,
             ewkt,
@@ -277,7 +306,7 @@ def main():
 
 def init_tileset(conn):
     """初始化瓦片集，解析所有瓦片并插入数据库"""
-    ROOT_TILESET_DIR = "../3dtiles"  # 根目录（包含根tileset.json）
+    ROOT_TILESET_DIR = "../../3dtiles"  # 根目录（包含根tileset.json）
 
     print(f"🔍 正在查找 {ROOT_TILESET_DIR} 下的所有 tileset.json...")
     all_tileset_files = find_all_tileset_files(ROOT_TILESET_DIR)
